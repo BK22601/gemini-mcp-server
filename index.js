@@ -62,26 +62,51 @@ app.post("/token", (req, res) => {
   res.json({ access_token: randomUUID(), token_type: "Bearer", expires_in: 86400 });
 });
 
+async function downloadFromGoogleDrive(fileId, destPath) {
+  const url = `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t`;
+  const res = await fetch(url, {
+    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
+    redirect: "follow"
+  });
+  if (!res.ok) throw new Error(`Download failed: ${res.statusText}`);
+  const contentType = res.headers.get("content-type") || "";
+  if (contentType.includes("text/html")) throw new Error("Google Drive returned a confirmation page — make sure the file is shared as 'Anyone with the link'");
+  fs.writeFileSync(destPath, Buffer.from(await res.arrayBuffer()));
+}
+
 function buildMcpServer() {
   const server = new McpServer({ name: "gemini-video-analyzer", version: "1.0.0" });
-  server.tool("analyze_video", "Analyze a video from Google Drive using Gemini AI",
-    { video_url: z.string().describe("Google Drive share link"), question: z.string().describe("What do you want to know about the video?") },
+
+  server.tool(
+    "analyze_video",
+    "Analyze a video from Google Drive using Gemini AI",
+    {
+      video_url: z.string().describe("Google Drive share link"),
+      question: z.string().describe("What do you want to know about the video?")
+    },
     async ({ video_url, question }) => {
       let tempPath = null;
       try {
-        let downloadUrl = video_url;
         const match = video_url.match(/\/d\/([a-zA-Z0-9_-]+)/);
-        if (match) downloadUrl = `https://drive.google.com/uc?export=download&id=${match[1]}&confirm=1`;
+        if (!match) throw new Error("Invalid Google Drive link — make sure it contains /d/FILE_ID");
+        const fileId = match[1];
+
         tempPath = path.join(os.tmpdir(), `video_${Date.now()}.mp4`);
-        const res = await fetch(downloadUrl);
-        if (!res.ok) throw new Error(`Download failed: ${res.statusText}`);
-        fs.writeFileSync(tempPath, Buffer.from(await res.arrayBuffer()));
+        await downloadFromGoogleDrive(fileId, tempPath);
+
         const upload = await fileManager.uploadFile(tempPath, { mimeType: "video/mp4", displayName: "video" });
         let file = await fileManager.getFile(upload.file.name);
-        while (file.state === "PROCESSING") { await new Promise(r => setTimeout(r, 5000)); file = await fileManager.getFile(upload.file.name); }
-        if (file.state === "FAILED") throw new Error("Gemini failed to process video");
+        while (file.state === "PROCESSING") {
+          await new Promise(r => setTimeout(r, 5000));
+          file = await fileManager.getFile(upload.file.name);
+        }
+        if (file.state === "FAILED") throw new Error("Gemini failed to process the video — file may be corrupted or in an unsupported format");
+
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
-        const result = await model.generateContent([{ fileData: { mimeType: "video/mp4", fileUri: file.uri } }, question]);
+        const result = await model.generateContent([
+          { fileData: { mimeType: "video/mp4", fileUri: file.uri } },
+          question
+        ]);
         return { content: [{ type: "text", text: result.response.text() }] };
       } catch (err) {
         return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
@@ -121,7 +146,7 @@ app.delete("/mcp", (req, res) => {
   res.sendStatus(204);
 });
 
-// SSE (old protocol fallback)
+// SSE fallback
 app.get("/sse", async (req, res) => {
   const transport = new SSEServerTransport("/messages", res);
   sseTransports.set(transport.sessionId, transport);
