@@ -8,13 +8,45 @@ import fetch from "node-fetch";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import crypto from "crypto";
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const fileManager = new GoogleAIFileManager(process.env.GEMINI_API_KEY);
 const transports = new Map();
+
+// OAuth endpoints required by Claude.ai
+app.get("/.well-known/oauth-authorization-server", (req, res) => {
+  const base = `${req.protocol}://${req.get("host")}`;
+  res.json({
+    issuer: base,
+    authorization_endpoint: `${base}/authorize`,
+    token_endpoint: `${base}/token`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code"],
+    code_challenge_methods_supported: ["S256"]
+  });
+});
+
+app.get("/authorize", (req, res) => {
+  const { redirect_uri, state } = req.query;
+  const code = crypto.randomBytes(16).toString("hex");
+  const redirectUrl = new URL(redirect_uri);
+  redirectUrl.searchParams.set("code", code);
+  if (state) redirectUrl.searchParams.set("state", state);
+  res.redirect(redirectUrl.toString());
+});
+
+app.post("/token", (req, res) => {
+  res.json({
+    access_token: crypto.randomBytes(32).toString("hex"),
+    token_type: "Bearer",
+    expires_in: 86400
+  });
+});
 
 function buildServer() {
   const server = new McpServer({
