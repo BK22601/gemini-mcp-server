@@ -96,31 +96,29 @@ function buildMcpServer() {
     async ({ video_url, question }) => {
       let tempPath = null;
       try {
-        const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
 
         if (isYouTubeUrl(video_url)) {
-          // YouTube — pass directly, no download needed
+          // YouTube — pass URL directly, no download needed
           const youtubeUrl = normalizeYouTubeUrl(video_url);
-          const result = await model.generateContent({
-            contents: [{
-              role: "user",
-              parts: [
-                { fileData: { fileUri: youtubeUrl } },
-                { text: question }
-              ]
-            }]
-          });
+          console.log(`[YouTube] Analyzing: ${youtubeUrl}`);
+          const result = await model.generateContent([
+            { fileData: { fileUri: youtubeUrl } },
+            question
+          ]);
           return { content: [{ type: "text", text: result.response.text() }] };
         }
 
-        // Google Drive — download and upload to Gemini
+        // Google Drive — download and upload to Gemini File API
         const match = video_url.match(/\/d\/([a-zA-Z0-9_-]+)/);
         if (!match) throw new Error("Invalid link — use a Google Drive or YouTube URL");
         const fileId = match[1];
 
+        console.log(`[Drive] Downloading file ID: ${fileId}`);
         tempPath = path.join(os.tmpdir(), `video_${Date.now()}.mp4`);
         await downloadFromGoogleDrive(fileId, tempPath);
 
+        console.log(`[Drive] Uploading to Gemini File API...`);
         const upload = await fileManager.uploadFile(tempPath, { mimeType: "video/mp4", displayName: "video" });
         let file = await fileManager.getFile(upload.file.name);
         while (file.state === "PROCESSING") {
@@ -136,6 +134,7 @@ function buildMcpServer() {
         return { content: [{ type: "text", text: result.response.text() }] };
 
       } catch (err) {
+        console.error(`[Error] ${err.message}`);
         return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
       } finally {
         if (tempPath && fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
