@@ -31,7 +31,6 @@ const fileManager = new GoogleAIFileManager(process.env.GEMINI_API_KEY);
 const httpTransports = {};
 const sseTransports = new Map();
 
-// OAuth
 app.get("/.well-known/oauth-authorization-server", (req, res) => {
   const base = `${req.protocol}://${req.get("host")}`;
   res.json({
@@ -62,6 +61,16 @@ app.post("/token", (req, res) => {
   res.json({ access_token: randomUUID(), token_type: "Bearer", expires_in: 86400 });
 });
 
+function isYouTubeUrl(url) {
+  return /youtube\.com|youtu\.be/.test(url);
+}
+
+function normalizeYouTubeUrl(url) {
+  const match = url.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/))([a-zA-Z0-9_-]{11})/);
+  if (match) return `https://www.youtube.com/watch?v=${match[1]}`;
+  return url;
+}
+
 async function downloadFromGoogleDrive(fileId, destPath) {
   const url = `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t`;
   const res = await fetch(url, {
@@ -79,16 +88,34 @@ function buildMcpServer() {
 
   server.tool(
     "analyze_video",
-    "Analyze a video from Google Drive using Gemini AI",
+    "Analyze a video from Google Drive or YouTube using Gemini AI",
     {
-      video_url: z.string().describe("Google Drive share link"),
+      video_url: z.string().describe("Google Drive share link or YouTube URL"),
       question: z.string().describe("What do you want to know about the video?")
     },
     async ({ video_url, question }) => {
       let tempPath = null;
       try {
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
+
+        if (isYouTubeUrl(video_url)) {
+          // YouTube — pass directly, no download needed
+          const youtubeUrl = normalizeYouTubeUrl(video_url);
+          const result = await model.generateContent({
+            contents: [{
+              role: "user",
+              parts: [
+                { fileData: { fileUri: youtubeUrl } },
+                { text: question }
+              ]
+            }]
+          });
+          return { content: [{ type: "text", text: result.response.text() }] };
+        }
+
+        // Google Drive — download and upload to Gemini
         const match = video_url.match(/\/d\/([a-zA-Z0-9_-]+)/);
-        if (!match) throw new Error("Invalid Google Drive link — make sure it contains /d/FILE_ID");
+        if (!match) throw new Error("Invalid link — use a Google Drive or YouTube URL");
         const fileId = match[1];
 
         tempPath = path.join(os.tmpdir(), `video_${Date.now()}.mp4`);
@@ -100,14 +127,14 @@ function buildMcpServer() {
           await new Promise(r => setTimeout(r, 5000));
           file = await fileManager.getFile(upload.file.name);
         }
-        if (file.state === "FAILED") throw new Error("Gemini failed to process the video — file may be corrupted or in an unsupported format");
+        if (file.state === "FAILED") throw new Error("Gemini failed to process the video");
 
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
         const result = await model.generateContent([
           { fileData: { mimeType: "video/mp4", fileUri: file.uri } },
           question
         ]);
         return { content: [{ type: "text", text: result.response.text() }] };
+
       } catch (err) {
         return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
       } finally {
@@ -118,7 +145,6 @@ function buildMcpServer() {
   return server;
 }
 
-// Streamable HTTP (new protocol)
 app.post("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"];
   let transport;
@@ -146,7 +172,6 @@ app.delete("/mcp", (req, res) => {
   res.sendStatus(204);
 });
 
-// SSE fallback
 app.get("/sse", async (req, res) => {
   const transport = new SSEServerTransport("/messages", res);
   sseTransports.set(transport.sessionId, transport);
