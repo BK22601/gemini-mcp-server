@@ -91,4 +91,39 @@ function buildServer() {
           await new Promise(r => setTimeout(r, 5000));
           file = await fileManager.getFile(upload.file.name);
         }
-        if (file.state ===
+        if (file.state === "FAILED") throw new Error("Gemini failed to process video");
+
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
+        const result = await model.generateContent([
+          { fileData: { mimeType: "video/mp4", fileUri: file.uri } },
+          question
+        ]);
+        return { content: [{ type: "text", text: result.response.text() }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
+      } finally {
+        if (tempPath && fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+      }
+    }
+  );
+  return server;
+}
+
+app.get("/sse", async (req, res) => {
+  const transport = new SSEServerTransport("/messages", res);
+  const server = buildServer();
+  transports.set(transport.sessionId, transport);
+  res.on("close", () => transports.delete(transport.sessionId));
+  await server.connect(transport);
+});
+
+app.post("/messages", async (req, res) => {
+  const transport = transports.get(req.query.sessionId);
+  if (transport) await transport.handlePostMessage(req, res);
+  else res.status(400).send("Session not found");
+});
+
+app.get("/", (_, res) => res.send("Gemini MCP Server is running ✓"));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Running on port ${PORT}`));
