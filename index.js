@@ -1,6 +1,8 @@
 import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { GoogleAIFileManager } from "@google/generative-ai/server";
 import { z } from "zod";
@@ -16,6 +18,7 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, mcp-session-id");
+  res.setHeader("Access-Control-Expose-Headers", "mcp-session-id");
   if (req.method === "OPTIONS") { res.sendStatus(204); return; }
   next();
 });
@@ -25,8 +28,10 @@ app.use(express.urlencoded({ extended: true }));
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const fileManager = new GoogleAIFileManager(process.env.GEMINI_API_KEY);
-const transports = new Map();
+const httpTransports = {};
+const sseTransports = new Map();
 
+// OAuth
 app.get("/.well-known/oauth-authorization-server", (req, res) => {
   const base = `${req.protocol}://${req.get("host")}`;
   res.json({
@@ -42,19 +47,13 @@ app.get("/.well-known/oauth-authorization-server", (req, res) => {
 });
 
 app.post("/register", (req, res) => {
-  res.status(201).json({
-    client_id: randomUUID(),
-    client_id_issued_at: Math.floor(Date.now() / 1000),
-    client_secret_expires_at: 0,
-    ...req.body
-  });
+  res.status(201).json({ client_id: randomUUID(), client_id_issued_at: Math.floor(Date.now() / 1000), client_secret_expires_at: 0, ...req.body });
 });
 
 app.get("/authorize", (req, res) => {
   const { redirect_uri, state } = req.query;
-  const code = randomUUID();
   const url = new URL(redirect_uri);
-  url.searchParams.set("code", code);
+  url.searchParams.set("code", randomUUID());
   if (state) url.searchParams.set("state", state);
   res.redirect(url.toString());
 });
@@ -63,41 +62,26 @@ app.post("/token", (req, res) => {
   res.json({ access_token: randomUUID(), token_type: "Bearer", expires_in: 86400 });
 });
 
-function buildServer() {
+function buildMcpServer() {
   const server = new McpServer({ name: "gemini-video-analyzer", version: "1.0.0" });
-
-  server.tool(
-    "analyze_video",
-    "Analyze a video from Google Drive using Gemini AI",
-    {
-      video_url: z.string().describe("Google Drive share link"),
-      question: z.string().describe("What do you want to know about the video?")
-    },
+  server.tool("analyze_video", "Analyze a video from Google Drive using Gemini AI",
+    { video_url: z.string().describe("Google Drive share link"), question: z.string().describe("What do you want to know about the video?") },
     async ({ video_url, question }) => {
       let tempPath = null;
       try {
         let downloadUrl = video_url;
         const match = video_url.match(/\/d\/([a-zA-Z0-9_-]+)/);
         if (match) downloadUrl = `https://drive.google.com/uc?export=download&id=${match[1]}&confirm=1`;
-
         tempPath = path.join(os.tmpdir(), `video_${Date.now()}.mp4`);
         const res = await fetch(downloadUrl);
         if (!res.ok) throw new Error(`Download failed: ${res.statusText}`);
         fs.writeFileSync(tempPath, Buffer.from(await res.arrayBuffer()));
-
         const upload = await fileManager.uploadFile(tempPath, { mimeType: "video/mp4", displayName: "video" });
         let file = await fileManager.getFile(upload.file.name);
-        while (file.state === "PROCESSING") {
-          await new Promise(r => setTimeout(r, 5000));
-          file = await fileManager.getFile(upload.file.name);
-        }
+        while (file.state === "PROCESSING") { await new Promise(r => setTimeout(r, 5000)); file = await fileManager.getFile(upload.file.name); }
         if (file.state === "FAILED") throw new Error("Gemini failed to process video");
-
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
-        const result = await model.generateContent([
-          { fileData: { mimeType: "video/mp4", fileUri: file.uri } },
-          question
-        ]);
+        const result = await model.generateContent([{ fileData: { mimeType: "video/mp4", fileUri: file.uri } }, question]);
         return { content: [{ type: "text", text: result.response.text() }] };
       } catch (err) {
         return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
@@ -109,16 +93,44 @@ function buildServer() {
   return server;
 }
 
+// Streamable HTTP (new protocol)
+app.post("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"];
+  let transport;
+  if (sessionId && httpTransports[sessionId]) {
+    transport = httpTransports[sessionId];
+  } else if (!sessionId && isInitializeRequest(req.body)) {
+    transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID(), onsessioninitialized: (id) => { httpTransports[id] = transport; } });
+    transport.onclose = () => { if (transport.sessionId) delete httpTransports[transport.sessionId]; };
+    await buildMcpServer().connect(transport);
+  } else {
+    res.status(400).json({ error: "Bad request" }); return;
+  }
+  await transport.handleRequest(req, res, req.body);
+});
+
+app.get("/mcp", async (req, res) => {
+  const transport = httpTransports[req.headers["mcp-session-id"]];
+  if (!transport) { res.status(400).json({ error: "No session" }); return; }
+  await transport.handleRequest(req, res);
+});
+
+app.delete("/mcp", (req, res) => {
+  const id = req.headers["mcp-session-id"];
+  if (id && httpTransports[id]) delete httpTransports[id];
+  res.sendStatus(204);
+});
+
+// SSE (old protocol fallback)
 app.get("/sse", async (req, res) => {
   const transport = new SSEServerTransport("/messages", res);
-  const server = buildServer();
-  transports.set(transport.sessionId, transport);
-  res.on("close", () => transports.delete(transport.sessionId));
-  await server.connect(transport);
+  sseTransports.set(transport.sessionId, transport);
+  res.on("close", () => sseTransports.delete(transport.sessionId));
+  await buildMcpServer().connect(transport);
 });
 
 app.post("/messages", async (req, res) => {
-  const transport = transports.get(req.query.sessionId);
+  const transport = sseTransports.get(req.query.sessionId);
   if (transport) await transport.handlePostMessage(req, res);
   else res.status(400).send("Session not found");
 });
